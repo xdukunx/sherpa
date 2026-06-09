@@ -395,9 +395,10 @@ def detect_toc(pages_text):
         return []
 
     # --- Step 1: Find TOC page ---
+    # Use \s* (not \s+) — OCR often merges "DAFTAR ISI" → "DAFTARISI"
     toc_start = None
     for pg in range(1, min(31, max_pg + 1)):
-        if re.search(r'DAFTAR\s+ISI|TABLE\s+OF\s+CONTENTS', pages_text.get(str(pg), ''), re.IGNORECASE):
+        if re.search(r'DAFTAR\s*ISI|TABLE\s*OF\s*CONTENTS', pages_text.get(str(pg), ''), re.IGNORECASE):
             toc_start = pg
             break
     if toc_start is None:
@@ -521,150 +522,274 @@ def add_pdf_bookmarks(pdf_path, toc_entries):
 # HOCR-based spatial TOC extraction
 # ---------------------------------------------------------------------------
 
-def _parse_hocr_words(hocr_bytes):
+def _parse_hocr_lines(hocr_bytes):
     """
-    Parse Tesseract HOCR (XHTML) output.
-    Returns a list of word dicts: {text, x1,y1,x2,y2, cx,cy, conf}.
+    Parse Tesseract HOCR and extract the bounding box of every *line*.
+    Returns list of {'text': str, 'x1','y1','x2','y2'}.
+
+    We use line-level spans ('ocr_line') instead of word-level spans because
+    a full-line bbox is all we need to place a clickable hyperlink rectangle.
     """
     try:
         text = hocr_bytes.decode('utf-8', errors='replace')
-        # Remove DOCTYPE — ET chokes on it
         text = re.sub(r'<!DOCTYPE[^>]*>', '', text)
         root_el = ET.fromstring(text)
     except ET.ParseError as exc:
         print(f"[hocr] XML parse error: {exc}")
         return []
 
-    words = []
+    lines = []
     for elem in root_el.iter():
         local = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
-        if local == 'span' and 'ocrx_word' in elem.get('class', ''):
-            raw = ''.join(elem.itertext()).strip()
+        if local == 'span' and 'ocr_line' in elem.get('class', ''):
             title_attr = elem.get('title', '')
             bbox = re.search(r'bbox\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)', title_attr)
-            conf = re.search(r'x_wconf\s+(\d+)', title_attr)
-            if bbox and raw:
-                x1, y1, x2, y2 = int(bbox[1]), int(bbox[2]), int(bbox[3]), int(bbox[4])
-                words.append({
-                    'text': raw,
-                    'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
-                    'cx': (x1 + x2) // 2,
-                    'cy': (y1 + y2) // 2,
-                    'conf': int(conf[1]) if conf else 50,
+            line_text = re.sub(r'\s+', ' ', ''.join(elem.itertext())).strip()
+            if bbox and line_text:
+                lines.append({
+                    'text': line_text,
+                    'x1': int(bbox[1]), 'y1': int(bbox[2]),
+                    'x2': int(bbox[3]), 'y2': int(bbox[4]),
                 })
-    return words
+    return lines
 
 
-def _extract_toc_entries_from_words(words, img_width, img_height):
+def _match_toc_entries_to_lines(toc_entries, hocr_lines, img_width):
     """
-    Spatial TOC detection using word bounding boxes from HOCR.
+    Match TOC entries (from regex-based detect_toc) to HOCR line bounding boxes.
 
-    Algorithm:
-      1. Group words into lines by Y-center proximity (±12 px).
-      2. For each line, find the rightmost isolated number that:
-           - lives in the right 30 % of the page width, AND
-           - has a gap of ≥ 20 % page-width between it and the title words.
-         That number is the TOC page number.
-      3. Everything to the left (excluding dot-only words) = title.
-      4. Classify level from title text:
-           level 1 → BAB / CHAPTER heading
-           level 2 → X.Y section numbering
-           level 0 → preliminary pages (LEMBAR, ABSTRAK, etc.) — hyperlink only
+    Strategy: for each TOC entry, find the HOCR line whose text has the
+    highest word-overlap with the entry title. The line bbox becomes the
+    clickable hyperlink rectangle for that entry.
 
-    Returns list of:
-        {'title', 'toc_page': int, 'level': 0|1|2,
-         'bbox': (x1, y1, x2, y2)  ← image-pixel bounding box for the link}
+    Returns the same list with 'bbox' added to matched entries.
     """
-    if not words:
-        return []
+    def _norm(s):
+        # Keep only alphanumeric tokens, upper-cased, remove short noise
+        tokens = re.sub(r'[^A-Z0-9\s]', ' ', s.upper()).split()
+        return {t for t in tokens if len(t) >= 2}
 
-    # Group into lines
-    sorted_w = sorted(words, key=lambda w: (w['cy'], w['x1']))
-    lines, cur = [], [sorted_w[0]]
-    for w in sorted_w[1:]:
-        if abs(w['cy'] - cur[-1]['cy']) <= 12:
-            cur.append(w)
-        else:
-            lines.append(sorted(cur, key=lambda x: x['x1']))
-            cur = [w]
-    lines.append(sorted(cur, key=lambda x: x['x1']))
+    used = set()
+    result = []
 
-    right_zone = img_width * 0.70   # page numbers start after this X
-    min_gap    = img_width * 0.20   # minimum gap between title text end and page number
+    for entry in toc_entries:
+        title_tokens = _norm(entry['title'])
+        best_idx, best_score = -1, 0.0
 
-    entries = []
-    for line in lines:
-        if len(line) < 2:
-            continue
+        for i, line in enumerate(hocr_lines):
+            if i in used:
+                continue
+            line_tokens = _norm(line['text'])
+            if not title_tokens or not line_tokens:
+                continue
+            inter = len(title_tokens & line_tokens)
+            union = len(title_tokens | line_tokens)
+            score = inter / union if union else 0.0
+            if score > best_score:
+                best_score = score
+                best_idx = i
 
-        # Find rightmost number in right zone (lowest confidence threshold = 25)
-        pg_word = None
-        for w in reversed(line):
-            if (re.fullmatch(r'\d{1,3}', w['text'])
-                    and w['conf'] >= 25
-                    and w['x1'] >= right_zone):
-                pg_word = w
-                break
-        if not pg_word:
-            continue
+        e = dict(entry)
+        if best_idx >= 0 and best_score >= 0.35:
+            ln = hocr_lines[best_idx]
+            used.add(best_idx)
+            # Full-width row so the entire line is clickable (easier to hit)
+            e['bbox'] = (0, ln['y1'], img_width, ln['y2'])
+        # If no match, entry keeps no 'bbox' → no hyperlink, but bookmark still added
+        result.append(e)
 
-        # Title words: left of page number, skip pure-dot / dash words
-        title_words = [
-            w for w in line
-            if w['x2'] < pg_word['x1'] - 5
-            and not re.fullmatch(r'[.\s·…\-_]{1,}', w['text'])
-        ]
-        if not title_words:
-            continue
-
-        # Enforce minimum gap
-        title_right = max(w['x2'] for w in title_words)
-        if (pg_word['x1'] - title_right) < min_gap:
-            continue
-
-        title_text = re.sub(r'\s+', ' ',
-                            ' '.join(w['text'] for w in title_words)).strip()
-        if len(title_text) < 3:
-            continue
-
-        # Bounding box — full line from title start to page-number end
-        lx1 = min(w['x1'] for w in title_words)
-        ly1 = min(w['y1'] for w in line)
-        lx2 = pg_word['x2']
-        ly2 = max(w['y2'] for w in line)
-
-        # Level classification
-        if re.match(r'(?i)^(?:BAB|CHAPTER)\s+[IVX]+', title_text):
-            level = 1
-        elif re.match(r'^\d{1,2}\.\d{1,2}', title_text):
-            level = 2
-        elif re.match(
-            r'(?i)^(?:DAFTAR|ABSTRAK|KATA\s*PENGANTAR|LEMBAR|HALAMAN|'
-            r'PERNYATAAN|UCAPAN|ABSTRACT|SUMMARY)',
-            title_text
-        ):
-            level = 0   # preliminary — hyperlink only, no sidebar bookmark
-        else:
-            level = 2   # default to section
-
-        entries.append({
-            'title': title_text,
-            'toc_page': int(pg_word['text']),
-            'level': level,
-            'bbox': (lx1, ly1, lx2, ly2),
-        })
-
-    return entries
+    return result
 
 
-def _run_hocr_on_image(img_path):
-    """Preprocess image then run Tesseract HOCR. Returns (words, img_w, img_h)."""
+def _run_hocr_lines_on_image(img_path):
+    """Preprocess image, run Tesseract HOCR, return (lines, img_w, img_h)."""
     img = preprocess_image_for_ocr(img_path)
     iw, ih = img.size
     hocr = pytesseract.image_to_pdf_or_hocr(
-        img, extension='hocr', lang='ind+eng', config='--oem 1 --psm 3'
+        img, extension='hocr', lang='ind+eng', config='--oem 1 --psm 6'
     )
-    return _parse_hocr_words(hocr), iw, ih
+    return _parse_hocr_lines(hocr), iw, ih
+
+
+# OCR single-char misreads → correct digit (applies to small page numbers)
+_OCR_DIGIT_FIXES = {
+    'V': 1, 'v': 1, 'I': 1, 'l': 1, '!': 1,
+    'O': 0, 'o': 0, 'Q': 0,
+    'S': 5, 's': 5, 'T': 7, 'B': 8,
+}
+
+
+def _try_parse_toc_page(token):
+    """
+    Try to extract a page number (int) from a possibly OCR-corrupted token.
+    Returns None for roman-numeral preliminary pages or unrecognisable tokens.
+    """
+    if not token:
+        return None
+    # Clean token (remove trailing punctuation)
+    tok = token.rstrip('.,;:')
+    # Pure arabic number
+    if re.match(r'^\d{1,3}$', tok):
+        return int(tok)
+    # Roman numeral → preliminary page, skip
+    if re.match(r'^[ivxlcdmIVXLCDM]{1,5}$', tok):
+        return None
+    # Single-char OCR misread
+    if tok in _OCR_DIGIT_FIXES:
+        return _OCR_DIGIT_FIXES[tok]
+    # Multi-char with embedded digits (e.g. "1l" → 1)
+    digits = re.sub(r'\D', '', tok)
+    if digits and len(digits) <= 3:
+        return int(digits)
+    return None
+
+
+def _is_noise_token(tok):
+    """True when a token looks like OCR dot-leader noise (e.g. 'ooooo', '....', 'rsssnnn')."""
+    if len(tok) < 4:
+        return False
+    tl = tok.lower()
+    # Dominant character covers ≥ 70 % of the token
+    most = max(set(tl), key=tl.count)
+    if tl.count(most) / len(tl) >= 0.70:
+        return True
+    # Token is mostly 'noise' characters (dots, dashes, o/s/r/n common in OCR dots)
+    noise_count = sum(1 for c in tl if c in '.orsn-_')
+    if noise_count / len(tl) >= 0.70:
+        return True
+    return False
+
+
+def detect_toc_from_hocr(hocr_lines, pages_text, toc_page_num, img_width):
+    """
+    Extract TOC entries AND their on-page bounding boxes from HOCR line data.
+
+    Handles:
+      • OCR-merged "DAFTARISI" (filtered before calling this function)
+      • OCR noise in the dotted-leader area (repeated-char runs like 'ooooo')
+      • Single-char OCR misreads of page numbers:
+          V→1  T→7  O→0  S→5  B→8  (common in mobile-resolution flipbooks)
+      • Roman numerals correctly distinguished from number misreads:
+          — For BAB/section lines, single uppercase letters are treated as
+            misread digits (V=1 is more likely than roman numeral V=5).
+          — For preliminary lines we don't create entries at all.
+
+    Returns list of:
+        {'title', 'page': abs_pdf_page, 'level': 1|2, 'bbox': (x1,y1,x2,y2)}
+    """
+    max_pg = max((int(k) for k in pages_text.keys()), default=0) or 1
+    raw = []
+
+    for line in hocr_lines:
+        text = line['text'].strip()
+        tokens = text.split()
+        if len(tokens) < 2:
+            continue
+
+        # Pre-classify the line type from its first tokens
+        is_bab     = bool(re.match(r'(?i)^(?:BAB|CHAPTER)\s+[IVX]+', text))
+        is_section = bool(re.match(r'^\d{1,2}\.\d{1,2}', text))
+
+        if not (is_bab or is_section):
+            continue   # only process chapter/section lines
+
+        # Extract page number from end of line.
+        # For BAB/section lines we treat single-char tokens as OCR misreads
+        # FIRST (before treating them as roman numerals).
+        pg = None
+        title_end_idx = len(tokens)
+
+        for back in (1, 2):
+            if len(tokens) < back + 1:
+                break
+            tok = tokens[-back].rstrip('.,;:')
+            if not tok:
+                continue
+
+            # 1. Arabic digit
+            if re.match(r'^\d{1,3}$', tok):
+                pg = int(tok)
+                title_end_idx = len(tokens) - back
+                break
+            # 2. Single-char OCR misread (higher priority than roman-numeral check
+            #    for chapter/section lines where pages are always arabic)
+            if tok in _OCR_DIGIT_FIXES:
+                pg = _OCR_DIGIT_FIXES[tok]
+                title_end_idx = len(tokens) - back
+                break
+            # 3. Embedded digits ONLY for short, non-noise tokens (e.g. "1l"→1)
+            #    Skip noise tokens like "ooooooo2" — that's the dot-leader, not a page num
+            if not _is_noise_token(tok):
+                digits = re.sub(r'\D', '', tok)
+                if digits and len(digits) <= 3:
+                    pg = int(digits)
+                    title_end_idx = len(tokens) - back
+                    break
+
+        if pg is None or pg == 0:
+            continue
+
+        # Title: tokens from line start, stopping at any OCR noise token
+        title_tokens = []
+        for tok in tokens[:title_end_idx]:
+            if _is_noise_token(tok):
+                break
+            title_tokens.append(tok)
+
+        title = re.sub(r'[\s.·\-]+$', '', ' '.join(title_tokens)).strip()
+        # Strip trailing dot-noise globs and isolated low-value tokens
+        title = re.sub(r'[\-\.oOsS]{3,}$', '', title).strip()
+        # Remove trailing 1-4 char tokens that look like OCR garbage
+        # (single lowercase blobs, lone special chars like '@', '~', '€')
+        title = re.sub(r'\s+[a-z]{1,4}\s*$', '', title).strip()
+        title = re.sub(r'\s+[@~€•°·\-_]{1,3}\s*$', '', title).strip()
+
+        if len(title) < 3:
+            continue
+
+        level = 1 if is_bab else 2
+
+        raw.append({
+            'title':    title,
+            'toc_page': pg,
+            'level':    level,
+            'bbox':     (0, line['y1'], img_width, line['y2']),
+        })
+
+    if not raw:
+        return []
+
+    # Calculate page offset
+    chapters = [e for e in raw if e['level'] == 1]
+    first_ch = min(chapters, key=lambda e: e['toc_page'],
+                   default=min(raw, key=lambda e: e['toc_page']))
+
+    offset = toc_page_num + 1   # rough default
+    for scan_pg in range(toc_page_num + 1, min(toc_page_num + 45, max_pg + 1)):
+        if re.search(r'PENDAHULUAN|INTRODUCTION|BAB\s+I\b',
+                     pages_text.get(str(scan_pg), ''), re.IGNORECASE):
+            offset = scan_pg - first_ch['toc_page']
+            break
+
+    # Convert and validate: TOC page numbers must be monotonically increasing
+    result   = []
+    last_pg  = 0
+    for e in raw:
+        pdf_page = max(1, e['toc_page'] + offset)
+        # Skip entries where page order regresses significantly (likely OCR error)
+        if pdf_page < last_pg - 2:
+            print(f"[hocr] Skipping out-of-order entry: '{e['title']}' p.{pdf_page} (prev={last_pg})")
+            continue
+        if pdf_page <= max_pg:
+            result.append({
+                'title': e['title'],
+                'page':  pdf_page,
+                'level': e['level'],
+                'bbox':  e['bbox'],
+            })
+            last_pg = pdf_page
+
+    return sorted(result, key=lambda e: (e['page'], e['level']))
 
 
 # ---------------------------------------------------------------------------
@@ -922,7 +1047,7 @@ async def process_ocr_job(doc_id, progress_tracker):
     # --- Find TOC page(s) in OCR text ---
     toc_pages = []   # list of (1-indexed page num, img_path)
     for pg in range(1, min(31, total_pages + 1)):
-        if re.search(r'DAFTAR\s+ISI|TABLE\s+OF\s+CONTENTS',
+        if re.search(r'DAFTAR\s*ISI|TABLE\s*OF\s*CONTENTS',
                      pages_text.get(str(pg), ''), re.IGNORECASE):
             toc_pages.append((pg, os.path.join(img_folder, all_files[pg - 1])))
             # Include next page if it looks like it continues the TOC
@@ -945,111 +1070,73 @@ async def process_ocr_job(doc_id, progress_tracker):
         except Exception as exc:
             print(f"[flipbook] Probe error: {exc}")
 
-    # --- Strategy B: HOCR spatial analysis ---
-    # For each TOC page, run HOCR and extract entries with bounding boxes.
-    hocr_entries_by_page = {}   # pdf_page_idx (0-based) → list of entry dicts
-    page_dims             = {}   # pdf_page_idx → (img_w, img_h)
+    # ── Phase 4 & 5: TOC detection + bookmarks + hyperlinks ─────────────
+    # Primary strategy: run HOCR on each TOC page → get line text + bboxes.
+    # detect_toc_from_hocr() extracts page numbers (with OCR correction) AND
+    # line bounding boxes in one pass, so hyperlinks come for free.
+    # Fallback: regex on OCR text (detect_toc) if HOCR yields nothing.
+
+    progress_tracker['message'] = 'Mendeteksi Daftar Isi (HOCR + koreksi OCR)...'
+    bookmark_entries = []
+    total_links      = 0
 
     for toc_pgnum, toc_imgpath in toc_pages:
+        pdf_pg_idx = toc_pgnum - 1   # 0-indexed
+
+        # Run HOCR
         try:
-            words, iw, ih = await loop.run_in_executor(
-                None, _run_hocr_on_image, toc_imgpath
+            hocr_lines, iw, ih = await loop.run_in_executor(
+                None, _run_hocr_lines_on_image, toc_imgpath
             )
-            entries = _extract_toc_entries_from_words(words, iw, ih)
-            idx = toc_pgnum - 1   # 0-indexed
-            hocr_entries_by_page[idx] = entries
-            page_dims[idx] = (iw, ih)
             progress_tracker['message'] = (
-                f"HOCR halaman {toc_pgnum}: {len(entries)} entri terdeteksi"
+                f"HOCR halaman {toc_pgnum}: {len(hocr_lines)} baris"
             )
         except Exception as exc:
-            print(f"[hocr] TOC page {toc_pgnum} error: {exc}")
-
-    # Flatten HOCR entries, tagging each with its source PDF page index
-    all_hocr = []
-    for pdf_pg_idx, entries in hocr_entries_by_page.items():
-        for e in entries:
-            all_hocr.append({**e, 'src_idx': pdf_pg_idx})
-
-    # --- Calculate page offset ---
-    # Use flipbook data to validate/anchor, otherwise scan OCR text
-    offset = 0
-    if all_hocr:
-        chapters = [e for e in all_hocr if e['level'] == 1]
-        first_ch = min(chapters, key=lambda e: e['toc_page'], default=None)
-        if first_ch is None:
-            first_ch = min(all_hocr, key=lambda e: e['toc_page'])
-
-        # If flipbook gave us an exact answer, trust it
-        for title_key, fb_page in flipbook_link_map.items():
-            if first_ch['title'].lower() in title_key or title_key in first_ch['title'].lower():
-                offset = fb_page - first_ch['toc_page']
-                print(f"[offset] Anchored from flipbook data: offset={offset}")
-                break
-        else:
-            # Scan OCR text for BAB I / PENDAHULUAN
-            first_toc_pg = toc_pages[0][0] if toc_pages else 1
-            for scan_pg in range(first_toc_pg + 1, min(first_toc_pg + 45, total_pages + 1)):
-                if re.search(r'PENDAHULUAN|INTRODUCTION|BAB\s+I\b',
-                             pages_text.get(str(scan_pg), ''), re.IGNORECASE):
-                    offset = scan_pg - first_ch['toc_page']
-                    print(f"[offset] Found BAB I at page {scan_pg}: offset={offset}")
-                    break
-            else:
-                offset = (toc_pages[0][0] + 1) if toc_pages else 1
-                print(f"[offset] Fallback offset={offset}")
-
-    # ── Phase 4: Add sidebar bookmarks ────────────────────────────────────
-    progress_tracker['message'] = 'Menambahkan bookmark PDF...'
-    bookmark_entries = []
-
-    if all_hocr:
-        for e in all_hocr:
-            if e['level'] in (1, 2):
-                pdf_page = max(1, e['toc_page'] + offset)
-                if pdf_page <= total_pages:
-                    bookmark_entries.append({
-                        'title': e['title'],
-                        'page':  pdf_page,
-                        'level': e['level'],
-                    })
-        bookmark_entries.sort(key=lambda e: (e['page'], e['level']))
-        # Deduplicate (same title + same page)
-        seen = set()
-        deduped = []
-        for b in bookmark_entries:
-            key = (b['title'], b['page'])
-            if key not in seen:
-                seen.add(key)
-                deduped.append(b)
-        bookmark_entries = deduped
-
-    if not bookmark_entries:
-        # Strategy C fallback: regex
-        bookmark_entries = detect_toc(pages_text)
-
-    if bookmark_entries:
-        add_pdf_bookmarks(output_pdf_path, bookmark_entries)
-        progress_tracker['message'] = (
-            f"{len(bookmark_entries)} bookmark ditambahkan ke PDF."
-        )
-
-    # ── Phase 5: Inject in-page hyperlinks on TOC page(s) ─────────────────
-    progress_tracker['message'] = 'Menambahkan hyperlink pada halaman Daftar Isi...'
-    total_links = 0
-
-    for pdf_pg_idx, entries in hocr_entries_by_page.items():
-        if pdf_pg_idx not in page_dims:
+            print(f"[hocr] TOC page {toc_pgnum}: {exc}")
             continue
-        iw, ih = page_dims[pdf_pg_idx]
+
+        # Strategy B: HOCR with OCR correction (also gives bboxes)
+        hocr_entries = detect_toc_from_hocr(hocr_lines, pages_text, toc_pgnum, iw)
+
+        if not hocr_entries:
+            # Strategy C fallback: regex on OCR text
+            hocr_entries = detect_toc(pages_text)
+            # For fallback, still try to match to HOCR lines for hyperlinks
+            if hocr_entries:
+                hocr_entries = _match_toc_entries_to_lines(hocr_entries, hocr_lines, iw)
+
+        # Collect bookmarks (de-duplicated across TOC pages)
+        existing_titles = {e['title'] for e in bookmark_entries}
+        for e in hocr_entries:
+            if e.get('level', 0) in (1, 2) and e['title'] not in existing_titles:
+                bookmark_entries.append({k: e[k] for k in ('title', 'page', 'level')})
+                existing_titles.add(e['title'])
+
+        # Inject hyperlinks on this TOC page
         link_entries = []
-        for e in entries:
-            tgt_page = max(0, e['toc_page'] + offset - 1)   # 0-indexed
+        for e in hocr_entries:
+            if 'bbox' not in e:
+                continue
+            tgt_page = max(0, e['page'] - 1)   # 0-indexed
             if 0 <= tgt_page < total_pages:
                 link_entries.append({'bbox': e['bbox'], 'target_page': tgt_page})
+
         if link_entries:
             add_toc_hyperlinks(output_pdf_path, pdf_pg_idx, link_entries, iw, ih)
             total_links += len(link_entries)
+
+    # Final fallback: no TOC pages found at all
+    if not bookmark_entries:
+        bookmark_entries = detect_toc(pages_text)
+
+    # Add sidebar bookmarks
+    progress_tracker['message'] = 'Menambahkan bookmark PDF...'
+    if bookmark_entries:
+        bookmark_entries.sort(key=lambda e: (e['page'], e['level']))
+        add_pdf_bookmarks(output_pdf_path, bookmark_entries)
+        progress_tracker['message'] = (
+            f"{len(bookmark_entries)} bookmark · {total_links} hyperlink ditambahkan."
+        )
 
     # ── Phase 6: Save text files ──────────────────────────────────────────
     with open(pages_json_path, 'w', encoding='utf-8') as f:

@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Scraped data (images, PDFs, OCR text — too large for git)
+data/
+
+# Old standalone image folders
+Judul Skripsi Kating/
+Judul Skripsi Kating (Fixed).pdf
+Judul Skripsi Kating (HD).pdf
+Judul Skripsi Kating.pdf
+
+# Test / temporary output PDFs
+test_*.pdf
+FINAL_TEST_LINKS.pdf
+*.temp.pdf
+
+# Dev / scratch scripts (superseded by scraper.py)
+fix_notebook_final.py
+fix_ordering_final.py
+fix_ssl.py
+generate_fixed_pdf.py
+generate_hd_pdf.py
+update_nb.py
+scrap_skripsi.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
