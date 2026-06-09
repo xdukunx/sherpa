@@ -8,7 +8,7 @@ from flask import Flask, jsonify, request, render_template, send_from_directory
 from scraper import (
     DATA_DIR, DOCUMENTS_JSON, load_documents, save_documents,
     scrape_unair_job, scrape_its_sharepoint_job, process_ocr_job,
-    detect_toc
+    rebuild_bookmarks_job, detect_toc
 )
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
@@ -246,6 +246,46 @@ def save_matrix():
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+def run_rebuild_thread(doc_id):
+    """Background thread: re-run bookmark + hyperlink injection on existing scraped doc."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        active_jobs[doc_id] = {
+            'status': 'Rebuilding bookmarks',
+            'message': 'Memulai proses rebuild...',
+            'current_page': 0,
+            'total_pages': 0,
+        }
+        n = loop.run_until_complete(rebuild_bookmarks_job(doc_id, active_jobs[doc_id]))
+        active_jobs[doc_id]['status']  = 'Completed'
+        active_jobs[doc_id]['message'] = f'Selesai: {n} bookmark diperbarui.'
+    except Exception as exc:
+        active_jobs[doc_id] = {
+            'status': 'Failed',
+            'message': f'Error: {str(exc)}',
+            'current_page': 0,
+            'total_pages': 0,
+        }
+    finally:
+        loop.close()
+
+
+@app.route('/api/documents/<doc_id>/rebuild-bookmarks', methods=['POST'])
+def rebuild_bookmarks(doc_id):
+    """Re-run TOC detection + bookmarks + hyperlinks without re-scraping."""
+    docs = load_documents()
+    if not any(d['id'] == doc_id for d in docs):
+        return jsonify({'error': 'Dokumen tidak ditemukan'}), 404
+
+    if doc_id in active_jobs and active_jobs[doc_id].get('status') in (
+            'Rebuilding bookmarks', 'Performing OCR'):
+        return jsonify({'error': 'Dokumen sedang diproses'}), 400
+
+    threading.Thread(target=run_rebuild_thread, args=(doc_id,)).start()
+    return jsonify({'success': True, 'doc_id': doc_id})
+
 
 @app.route('/api/documents/<doc_id>/bookmarks', methods=['GET'])
 def get_doc_bookmarks(doc_id):

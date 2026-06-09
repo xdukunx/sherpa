@@ -380,6 +380,58 @@ def _roman_to_int(s):
     return result
 
 
+def _toc_sort_key(entry):
+    """
+    Logical document-order sort key — uses chapter/section *numbers*, not page numbers.
+    This is immune to OCR mis-reads of page numbers.
+
+    BAB I  → (1, 0, 0)
+    BAB II → (2, 0, 0)
+    2.1    → (2, 1, 0)   ← belongs to BAB II
+    2.1.3  → (2, 1, 3)
+    4.4    → (4, 4, 0)   ← belongs to BAB IV
+    """
+    title = entry.get('title', '')
+
+    # Chapter: BAB I, BAB II, BAB III ...
+    m = re.match(r'(?i)^(?:BAB|CHAPTER)\s+([IVX]+)', title)
+    if m:
+        try:
+            return (_roman_to_int(m.group(1)), 0, 0)
+        except Exception:
+            pass
+
+    # Section: 2.1, 2.1.3, 4.4 ...
+    m = re.match(r'^(\d{1,2})\.(\d{1,2})(?:\.(\d{1,2}))?', title)
+    if m:
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+
+    # Fallback to page number for unrecognised entries
+    return (999, entry.get('page', 0), 0)
+
+
+def _is_content_page(text):
+    """
+    Return True if OCR text looks like actual chapter content rather than a TOC page.
+    Used to stop scanning consecutive TOC pages when we've moved past the Daftar Isi.
+    """
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return False
+
+    # Long average line = paragraphs = content
+    avg_len = sum(len(l) for l in lines) / len(lines)
+    if avg_len > 55:
+        return True
+
+    # A line that IS the chapter heading on its own (not a TOC entry)
+    for l in lines[:6]:
+        if re.match(r'^\s*BAB\s+[IVX]+\s*$', l, re.IGNORECASE):
+            return True
+
+    return False
+
+
 def detect_toc(pages_text):
     """
     Scans OCR'd page text for "DAFTAR ISI" / "TABLE OF CONTENTS",
@@ -459,20 +511,17 @@ def detect_toc(pages_text):
         return []
 
     # --- Step 3: Find page offset ---
-    # Identify the TOC entry for the first chapter (smallest page num ≤ 5)
-    chapters = [e for e in raw_entries if e['level'] == 1]
-    first_chapter = min(chapters, key=lambda e: e['toc_page'], default=None)
-    if first_chapter is None:
-        first_chapter = min(raw_entries, key=lambda e: e['toc_page'])
+    # In Indonesian academic theses BAB I is ALWAYS Arabic page 1.
+    # So: offset = (PDF page where BAB I starts) - 1.
+    # This is robust even when BAB I is not the first chapter on the current TOC page.
 
     offset = toc_start + 1  # rough default
 
-    # Search forward from the end of the TOC for the actual BAB I / chapter page
     scan_start = toc_start + 1
     for pdf_pg in range(scan_start, min(scan_start + 40, max_pg + 1)):
         text = pages_text.get(str(pdf_pg), '')
         if re.search(r'PENDAHULUAN|INTRODUCTION|BAB\s+I\b', text, re.IGNORECASE):
-            offset = pdf_pg - first_chapter['toc_page']
+            offset = pdf_pg - 1   # BAB I = Arabic page 1 → offset = pdf_pg - 1
             break
 
     # --- Step 4: Build final bookmark list (max 2 levels) ---
@@ -490,30 +539,56 @@ def detect_toc(pages_text):
 
 def add_pdf_bookmarks(pdf_path, toc_entries):
     """
-    Write a 2-level outline (bookmarks) into an existing PDF using pikepdf.
-    Chapters are top-level; sections are nested under their parent chapter.
+    Write a 2-level outline into an existing PDF using pikepdf.
+
+    KEY IMPROVEMENTS over naive sequential tracking:
+      • Sorted by _toc_sort_key (logical BAB/section number, not OCR page number)
+        → immune to OCR mis-reads such as "BAB IV page = 1"
+      • Section 4.x is nested under BAB IV by *numeric prefix match*,
+        not by whichever BAB happened to appear last in the list
+        → 4.x / 3.x / 2.x always go to the right parent regardless of order
     """
     if not toc_entries:
         return
 
     try:
+        # Sort by logical chapter/section order, not by OCR-guessed page number
+        sorted_entries = sorted(toc_entries, key=_toc_sort_key)
+
         with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
             total = len(pdf.pages)
+            # Map: chapter roman-integer → its OutlineItem (for child nesting)
+            chapter_items: dict = {}
+
             with pdf.open_outline() as outline:
-                current_chapter_item = None
-                for entry in toc_entries:
-                    # Clamp to valid page index (0-based)
+                for entry in sorted_entries:
                     page_idx = max(0, min(entry['page'] - 1, total - 1))
                     item = pikepdf.OutlineItem(entry['title'], page_idx)
-                    if entry['level'] == 1:
+
+                    if entry.get('level', 2) == 1:
                         outline.root.append(item)
-                        current_chapter_item = item
-                    elif entry['level'] == 2 and current_chapter_item is not None:
-                        current_chapter_item.children.append(item)
-                    else:
+                        # Register chapter number for later child nesting
+                        m = re.match(r'(?i)^(?:BAB|CHAPTER)\s+([IVX]+)', entry['title'])
+                        if m:
+                            try:
+                                chapter_items[_roman_to_int(m.group(1))] = item
+                            except Exception:
+                                pass
+
+                    else:  # level 2 section
+                        # Assign to parent by first digit of section number
+                        m = re.match(r'^(\d{1,2})\.', entry['title'])
+                        if m:
+                            parent_num = int(m.group(1))
+                            if parent_num in chapter_items:
+                                chapter_items[parent_num].children.append(item)
+                                continue
+                        # No matching parent found → add to root
                         outline.root.append(item)
+
             pdf.save(pdf_path)
-        print(f"[bookmarks] Added {len(toc_entries)} entries to {os.path.basename(pdf_path)}")
+
+        print(f"[bookmarks] Added {len(sorted_entries)} entries to {os.path.basename(pdf_path)}")
     except Exception as e:
         print(f"[bookmarks] Error adding bookmarks: {e}")
 
@@ -759,16 +834,17 @@ def detect_toc_from_hocr(hocr_lines, pages_text, toc_page_num, img_width):
     if not raw:
         return []
 
-    # Calculate page offset
-    chapters = [e for e in raw if e['level'] == 1]
-    first_ch = min(chapters, key=lambda e: e['toc_page'],
-                   default=min(raw, key=lambda e: e['toc_page']))
+    # Calculate page offset.
+    # Indonesian theses: BAB I is always Arabic page 1.
+    # Scan forward from the current TOC page to find where BAB I content starts.
+    # offset = (PDF page of BAB I) - 1     ← always correct, independent of which
+    #                                         chapter happens to be listed first here.
 
     offset = toc_page_num + 1   # rough default
     for scan_pg in range(toc_page_num + 1, min(toc_page_num + 45, max_pg + 1)):
         if re.search(r'PENDAHULUAN|INTRODUCTION|BAB\s+I\b',
                      pages_text.get(str(scan_pg), ''), re.IGNORECASE):
-            offset = scan_pg - first_ch['toc_page']
+            offset = scan_pg - 1   # BAB I = Arabic page 1
             break
 
     # Convert and validate: TOC page numbers must be monotonically increasing
@@ -950,6 +1026,264 @@ def add_toc_hyperlinks(pdf_path, toc_page_idx, link_entries, img_width, img_heig
 
 
 # ---------------------------------------------------------------------------
+# Playwright-based exact link extraction from live flipbook (Opera GX CDP)
+# ---------------------------------------------------------------------------
+
+async def _extract_flipbook_toc_links_via_cdp(root_url, toc_page_num):
+    """
+    Connect to Opera GX (already running with --remote-debugging-port=9222),
+    open (or reuse) the flipbook tab, navigate to the TOC page, then extract
+    every internal PDF link annotation visible on that page.
+
+    Returns list of {'title': str, 'page': int (1-indexed)} or None on failure.
+
+    This gives the *exact same* page targets as clicking in the original flipbook —
+    no OCR guessing needed.
+    """
+    if not root_url:
+        return None
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        print("[cdp] playwright not installed — skipping exact-link extraction")
+        return None
+
+    CDP_URL = "http://127.0.0.1:9222"
+
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.connect_over_cdp(CDP_URL)
+            context = browser.contexts[0]
+
+            # Prefer an already-open flipbook tab
+            page = None
+            for p in context.pages:
+                if 'ir.unair.ac.id' in p.url or 'DigitalCollection' in p.url:
+                    page = p
+                    break
+
+            if not page:
+                # Open the flipbook index
+                index_url = root_url.rstrip('/') + '/index.html'
+                page = await context.new_page()
+                await page.goto(index_url, wait_until='load', timeout=60000)
+                await asyncio.sleep(6)
+
+            # Navigate to the TOC page using common flipbook JS API patterns
+            await page.evaluate(f"""(async () => {{
+                const pg = {toc_page_num};
+                if (window.FLIPBOOK && window.FLIPBOOK.goTo) {{ window.FLIPBOOK.goTo(pg); return; }}
+                if (window.book && window.book.flipTo)        {{ window.book.flipTo(pg); return; }}
+                if (window.viewer && window.viewer.goToPage)  {{ window.viewer.goToPage(pg); return; }}
+                // Generic: look for a page-number input
+                const inp = document.querySelector('input[type="number"], input[aria-label*="page"]');
+                if (inp) {{
+                    inp.value = pg;
+                    inp.dispatchEvent(new Event('change', {{bubbles:true}}));
+                    inp.dispatchEvent(new KeyboardEvent('keydown', {{key:'Enter'}}));
+                }}
+            }})()""")
+            await asyncio.sleep(2.5)
+
+            # Extract link annotations and global outline data
+            raw = await page.evaluate("""() => {
+                const results = [];
+
+                // Method A: elements carrying a page-destination attribute
+                const selectors = [
+                    '[data-page]', '[data-dest]', '[data-link-page]',
+                    '[data-page-num]', '[data-goto]', 'a[href*="#page"]',
+                    'a[href*="page="]', 'a[href*="p="]',
+                ];
+                document.querySelectorAll(selectors.join(',')).forEach(el => {
+                    const pg = el.dataset.page || el.dataset.dest ||
+                               el.dataset.linkPage || el.dataset.pageNum ||
+                               el.dataset.goto;
+                    const hm = el.href && el.href.match(/[#?&](?:page|p)=(\\d+)/i);
+                    const pageNum = pg ? parseInt(pg) : (hm ? parseInt(hm[1]) : 0);
+                    const text = (el.innerText || el.title || el.alt || '').trim();
+                    if (pageNum > 0 && text.length >= 3)
+                        results.push({text, page: pageNum});
+                });
+
+                // Method B: global JavaScript variables the flipbook may expose
+                const globalKeys = [
+                    'bookmarks','outline','toc','book_toc','pageLinks',
+                    'BOOK_OUTLINE','bookOutline','pdfOutline',
+                ];
+                for (const key of globalKeys) {
+                    const val = window[key];
+                    if (!val || !Array.isArray(val)) continue;
+                    val.forEach(item => {
+                        if (!item) return;
+                        const text = (item.title || item.text || item.name || item.label || '').trim();
+                        const pg   = item.page || item.dest || item.pageNumber || 0;
+                        if (text.length >= 3 && parseInt(pg) > 0)
+                            results.push({text, page: parseInt(pg)});
+                    });
+                    if (results.length > 0) break;
+                }
+
+                return results;
+            }""")
+
+            if raw and len(raw) >= 3:
+                print(f"[cdp] Extracted {len(raw)} exact link targets from flipbook")
+                return [{'title': r['text'], 'page': r['page']} for r in raw if r['page'] > 0]
+
+    except Exception as exc:
+        print(f"[cdp] Flipbook link extraction failed: {exc}")
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Rebuild bookmarks on an already-scraped document (no re-OCR needed)
+# ---------------------------------------------------------------------------
+
+async def rebuild_bookmarks_job(doc_id, progress_tracker):
+    """
+    Re-run TOC detection, bookmark writing, and hyperlink injection for a
+    document that has already been scraped & OCR'd.
+
+    Reads  : data/<doc_id>/pages.json, images/, meta.json
+    Rewrites: data/<doc_id>/document.pdf  (adds/replaces bookmarks & hyperlinks)
+    """
+    doc_folder = os.path.join(DATA_DIR, doc_id)
+    img_folder = os.path.join(doc_folder, 'images')
+    pdf_path   = os.path.join(doc_folder, 'document.pdf')
+    pages_json = os.path.join(doc_folder, 'pages.json')
+
+    for path, label in ((pdf_path, 'PDF'), (pages_json, 'pages.json'), (img_folder, 'images')):
+        if not os.path.exists(path):
+            raise Exception(f"{label} tidak ditemukan di {doc_folder}")
+
+    with open(pages_json, 'r', encoding='utf-8') as f:
+        pages_text = json.load(f)
+
+    all_imgs = sorted(
+        [f for f in os.listdir(img_folder) if f.lower().endswith(('.jpg', '.png'))],
+        key=lambda x: int(os.path.splitext(x)[0])
+    )
+    total_pages = len(all_imgs)
+
+    # Read meta.json for the flipbook root URL
+    root_url = None
+    meta_path = os.path.join(doc_folder, 'meta.json')
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                root_url = json.load(f).get('root_url')
+        except Exception:
+            pass
+
+    progress_tracker['status']  = 'Rebuilding bookmarks'
+    progress_tracker['message'] = 'Mencari halaman Daftar Isi...'
+
+    # Find TOC pages (same logic as process_ocr_job)
+    toc_pages = []
+    for pg in range(1, min(31, total_pages + 1)):
+        if re.search(r'DAFTAR\s*ISI|TABLE\s*OF\s*CONTENTS',
+                     pages_text.get(str(pg), ''), re.IGNORECASE):
+            for toc_pg in range(pg, min(pg + 5, total_pages + 1)):
+                img_path = os.path.join(img_folder, all_imgs[toc_pg - 1])
+                text = pages_text.get(str(toc_pg), '')
+                if toc_pg > pg and _is_content_page(text):
+                    break
+                toc_pages.append((toc_pg, img_path))
+            break
+
+    if not toc_pages:
+        raise Exception("Halaman Daftar Isi tidak ditemukan dalam teks OCR.")
+
+    loop = asyncio.get_event_loop()
+
+    # Strategy A: exact flipbook link extraction via Playwright
+    flipbook_link_map = {}
+    if root_url:
+        progress_tracker['message'] = 'Mencoba ekstraksi link dari flipbook (Opera GX)...'
+        try:
+            fb_links = await _extract_flipbook_toc_links_via_cdp(root_url, toc_pages[0][0])
+            if fb_links:
+                flipbook_link_map = {e['title'].lower(): e['page'] for e in fb_links}
+                progress_tracker['message'] = (
+                    f"Link flipbook ditemukan: {len(flipbook_link_map)} entri"
+                )
+        except Exception as exc:
+            print(f"[rebuild] CDP probe failed: {exc}")
+
+    # Strategy B: HOCR + OCR correction on each TOC page
+    all_entries = []     # unified list across all TOC pages
+    all_link_data = {}   # pdf_page_idx → (entries_with_bbox, iw, ih)
+
+    for toc_pgnum, toc_imgpath in toc_pages:
+        progress_tracker['message'] = f"HOCR halaman {toc_pgnum}..."
+        try:
+            hocr_lines, iw, ih = await loop.run_in_executor(
+                None, _run_hocr_lines_on_image, toc_imgpath
+            )
+        except Exception as exc:
+            print(f"[rebuild] HOCR {toc_pgnum}: {exc}")
+            continue
+
+        entries = detect_toc_from_hocr(hocr_lines, pages_text, toc_pgnum, iw)
+
+        # Override page numbers with flipbook data if available
+        if flipbook_link_map:
+            for e in entries:
+                key = e['title'].lower()
+                for fb_title, fb_page in flipbook_link_map.items():
+                    title_words = set(key.split()) - {'bab', 'the', 'dan', 'dan'}
+                    fb_words    = set(fb_title.split()) - {'bab', 'the', 'dan', 'dan'}
+                    if title_words and fb_words and len(title_words & fb_words) / max(len(title_words), 1) >= 0.6:
+                        e['page'] = fb_page
+                        break
+
+        if not entries:
+            entries = detect_toc(pages_text)
+            if entries:
+                entries = _match_toc_entries_to_lines(entries, hocr_lines, iw)
+
+        all_link_data[toc_pgnum - 1] = (entries, iw, ih)
+
+        existing_titles = {e['title'] for e in all_entries}
+        for e in entries:
+            if e.get('level', 0) in (1, 2) and e['title'] not in existing_titles:
+                all_entries.append({k: e[k] for k in ('title', 'page', 'level')})
+                existing_titles.add(e['title'])
+
+    # Fallback: regex only
+    if not all_entries:
+        all_entries = detect_toc(pages_text)
+
+    # Write bookmarks
+    progress_tracker['message'] = 'Menulis bookmark PDF...'
+    if all_entries:
+        add_pdf_bookmarks(pdf_path, all_entries)
+
+    # Write hyperlinks
+    total_links = 0
+    for pdf_pg_idx, (entries, iw, ih) in all_link_data.items():
+        link_entries = []
+        for e in entries:
+            if 'bbox' not in e:
+                continue
+            tgt = max(0, e['page'] - 1)
+            if 0 <= tgt < total_pages:
+                link_entries.append({'bbox': e['bbox'], 'target_page': tgt})
+        if link_entries:
+            add_toc_hyperlinks(pdf_path, pdf_pg_idx, link_entries, iw, ih)
+            total_links += len(link_entries)
+
+    progress_tracker['status']  = 'Completed'
+    progress_tracker['message'] = (
+        f"Selesai: {len(all_entries)} bookmark · {total_links} hyperlink."
+    )
+    return len(all_entries)
+
+
+# ---------------------------------------------------------------------------
 # OCR + PDF compilation
 # ---------------------------------------------------------------------------
 
@@ -1045,16 +1379,19 @@ async def process_ocr_job(doc_id, progress_tracker):
             pass
 
     # --- Find TOC page(s) in OCR text ---
+    # Scan up to 5 consecutive pages starting from the first DAFTAR ISI page.
+    # Stop early when the text clearly becomes actual chapter content.
     toc_pages = []   # list of (1-indexed page num, img_path)
     for pg in range(1, min(31, total_pages + 1)):
         if re.search(r'DAFTAR\s*ISI|TABLE\s*OF\s*CONTENTS',
                      pages_text.get(str(pg), ''), re.IGNORECASE):
-            toc_pages.append((pg, os.path.join(img_folder, all_files[pg - 1])))
-            # Include next page if it looks like it continues the TOC
-            if pg < total_pages:
-                nxt = pages_text.get(str(pg + 1), '')
-                if not re.search(r'^\s*BAB\s+I\b', nxt, re.MULTILINE | re.IGNORECASE):
-                    toc_pages.append((pg + 1, os.path.join(img_folder, all_files[pg])))
+            for toc_pg in range(pg, min(pg + 5, total_pages + 1)):
+                img_path = os.path.join(img_folder, all_files[toc_pg - 1])
+                text = pages_text.get(str(toc_pg), '')
+                # Stop at actual content pages (after the first TOC page)
+                if toc_pg > pg and _is_content_page(text):
+                    break
+                toc_pages.append((toc_pg, img_path))
             break
 
     # --- Strategy A: Flipbook server probe ---
