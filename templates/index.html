@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SHERPA - Skripsi Helper & Repository Scraper</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- FontAwesome for Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="logo-icon">
+                    <i class="fa-solid fa-mountain-sun"></i>
+                </div>
+                <div class="brand-text">
+                    <h1>SHERPA</h1>
+                    <span>Skripsi Helper</span>
+                </div>
+            </div>
+            
+            <nav class="nav-menu">
+                <button class="nav-item active" data-tab="dashboard" id="btn-tab-dashboard">
+                    <i class="fa-solid fa-chart-pie"></i>
+                    <span>Dashboard</span>
+                </button>
+                <button class="nav-item" data-tab="scraper" id="btn-tab-scraper">
+                    <i class="fa-solid fa-cloud-arrow-down"></i>
+                    <span>Scraper</span>
+                </button>
+                <button class="nav-item" data-tab="reader" id="btn-tab-reader">
+                    <i class="fa-solid fa-book-open"></i>
+                    <span>Document Reader</span>
+                </button>
+                <button class="nav-item" data-tab="search" id="btn-tab-search">
+                    <i class="fa-solid fa-magnifying-glass"></i>
+                    <span>Full-Text Search</span>
+                </button>
+                <button class="nav-item" data-tab="matrix" id="btn-tab-matrix">
+                    <i class="fa-solid fa-table-list"></i>
+                    <span>Literature Matrix</span>
+                </button>
+            </nav>
+            
+            <div class="sidebar-footer">
+                <div class="status-indicator">
+                    <span class="pulse-dot"></span>
+                    <span>SHERPA Local Server Active</span>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Header -->
+            <header class="top-header">
+                <div class="page-title-area">
+                    <h2 id="current-tab-title">Dashboard</h2>
+                    <p id="current-tab-subtitle">Selamat datang di SHERPA! Ringkasan dokumen skripsi Anda.</p>
+                </div>
+                <div class="user-profile">
+                    <div class="profile-info">
+                        <span class="profile-name">DFTB+ Ag Research</span>
+                        <span class="profile-role">Komputasi Skripsi</span>
+                    </div>
+                    <div class="avatar">
+                        <i class="fa-solid fa-flask"></i>
+                    </div>
+                </div>
+            </header>
+
+            <!-- Tabs Container -->
+            <div class="tab-content-container">
+                
+                <!-- TAB 1: DASHBOARD -->
+                <section class="tab-pane active" id="tab-dashboard">
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-icon purple-gradient">
+                                <i class="fa-solid fa-file-pdf"></i>
+                            </div>
+                            <div class="stat-info">
+                                <h3>Total Dokumen</h3>
+                                <p class="stat-value" id="stats-total-docs">0</p>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon teal-gradient">
+                                <i class="fa-solid fa-file-lines"></i>
+                            </div>
+                            <div class="stat-info">
+                                <h3>Total Halaman Extracted</h3>
+                                <p class="stat-value" id="stats-total-pages">0</p>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon pink-gradient">
+                                <i class="fa-solid fa-heading"></i>
+                            </div>
+                            <div class="stat-info">
+                                <h3>Sintesis Matrix</h3>
+                                <p class="stat-value" id="stats-matrix-rows">0 baris</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="dashboard-row">
+                        <!-- Documents List Card -->
+                        <div class="dashboard-card glass-card list-card">
+                            <div class="card-header">
+                                <h3><i class="fa-solid fa-folder-open"></i> Perpustakaan Skripsi</h3>
+                                <button class="btn btn-secondary btn-sm" id="btn-refresh-library">
+                                    <i class="fa-solid fa-arrows-rotate"></i> Reload
+                                </button>
+                            </div>
+                            <div class="card-body">
+                                <div class="table-wrapper">
+                                    <table class="data-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Judul Dokumen</th>
+                                                <th>Sumber</th>
+                                                <th>Halaman</th>
+                                                <th>Aksi</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="library-docs-list">
+                                            <tr>
+                                                <td colspan="4" class="text-center text-muted">Belum ada dokumen. Pergi ke tab Scraper untuk mengunduh.</td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Active Scrapes & Instructions -->
+                        <div class="dashboard-card glass-card info-card">
+                            <div class="card-header">
+                                <h3><i class="fa-solid fa-circle-nodes"></i> Info Scraper & Penulisan</h3>
+                            </div>
+                            <div class="card-body font-sm">
+                                <div class="info-alert info">
+                                    <i class="fa-solid fa-circle-info"></i>
+                                    <div>
+                                        <strong>Tips Penulisan Literatur:</strong>
+                                        <p>Gunakan tab <strong>Search</strong> untuk mencari kata kunci (contoh: <em>dftb</em>, <em>reaksi</em>, <em>geometry</em>) di semua skripsi kating secara instan. Hasil pencarian bisa disalin dan dicatat di tab <strong>Literature Matrix</strong>.</p>
+                                    </div>
+                                </div>
+                                <h4 class="mt-3">Sumber Scraping yang Didukung:</h4>
+                                <ul class="source-list mt-2">
+                                    <li>
+                                        <span class="badge badge-unair">UNAIR</span> 
+                                        <strong>Airlangga Repository</strong> (mendukung URL landing page repository & URL flipbook index).
+                                    </li>
+                                    <li>
+                                        <span class="badge badge-its">ITS</span> 
+                                        <strong>SharePoint View-Only PDF</strong> (memerlukan browser Opera GX berjalan pada port debug 9222).
+                                    </li>
+                                </ul>
+                                <div class="mt-3 dev-panel">
+                                    <strong>Tesseract Status:</strong>
+                                    <p class="status-text text-success"><i class="fa-solid fa-circle-check"></i> Terhubung (C:\Program Files\Tesseract-OCR)</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- TAB 2: SCRAPER -->
+                <section class="tab-pane" id="tab-scraper">
+                    <div class="glass-card max-w-2xl mx-auto">
+                        <div class="card-header">
+                            <h3><i class="fa-solid fa-cloud-arrow-down"></i> Mulai Scraping Baru</h3>
+                        </div>
+                        <div class="card-body">
+                            <form id="scraper-form">
+                                <div class="form-group">
+                                    <label for="scrape-title">Judul / Label Dokumen</label>
+                                    <input type="text" id="scrape-title" placeholder="Contoh: Skripsi Kating Kimia DFTB Ag" required>
+                                    <small>Judul ini akan digunakan sebagai nama folder dan PDF output.</small>
+                                </div>
+
+                                <div class="form-row">
+                                    <div class="form-group flex-1">
+                                        <label for="scrape-source">Sumber Repository</label>
+                                        <select id="scrape-source">
+                                            <option value="unair">Repository Universitas Airlangga (UNAIR)</option>
+                                            <option value="its">SharePoint View-Only PDF (ITS / Lainnya)</option>
+                                        </select>
+                                    </div>
+                                </div>
+
+                                <div class="form-group">
+                                    <label for="scrape-url">URL Landing Page / Dokumen</label>
+                                    <input type="url" id="scrape-url" placeholder="https://..." required>
+                                    <small id="scrape-url-hint">Tempel URL halaman flipbook, index.html, atau URL landing page repository.</small>
+                                </div>
+
+                                <div class="its-instructions hidden" id="its-instructions-box">
+                                    <div class="info-alert warning">
+                                        <i class="fa-solid fa-triangle-exclamation"></i>
+                                        <div>
+                                            <strong>Persiapan SharePoint ITS:</strong>
+                                            <ol class="mt-1 pl-4">
+                                                <li>Tutup semua browser Opera GX Anda.</li>
+                                                <li>Buka command prompt / PowerShell, jalankan:
+                                                    <code class="block-code">& &quot;$env:LOCALAPPDATA\Programs\Opera GX\opera.exe&quot; --remote-debugging-port=9222</code>
+                                                </li>
+                                                <li>Di Opera GX yang terbuka, pastikan Anda sudah login ke SharePoint ITS dan buka tab PDF target.</li>
+                                                <li>Jalankan scraping ini.</li>
+                                            </ol>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="form-actions">
+                                    <button type="submit" class="btn btn-primary" id="btn-start-scrape">
+                                        <i class="fa-solid fa-circle-play"></i> Mulai Ambil Dokumen
+                                    </button>
+                                </div>
+                            </form>
+
+                            <!-- Scrape Progress Box -->
+                            <div class="scrape-progress-box hidden" id="progress-box">
+                                <hr class="my-4">
+                                <div class="progress-header">
+                                    <h4 id="progress-status">Mengunduh Dokumen...</h4>
+                                    <span id="progress-percentage">0%</span>
+                                </div>
+                                <div class="progress-bar-container">
+                                    <div class="progress-bar-fill" id="progress-bar-fill" style="width: 0%"></div>
+                                </div>
+                                <p class="progress-message" id="progress-message">Menginisialisasi scraping...</p>
+                                <div class="progress-sub-stats font-xs text-muted mt-2">
+                                    <span>Halaman diproses: <strong id="progress-page-count">0</strong></span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- TAB 3: DOCUMENT READER -->
+                <section class="tab-pane" id="tab-reader">
+                    <div class="reader-layout">
+                        <!-- Reader Sidebar (List of pages) -->
+                        <div class="reader-sidebar glass-card">
+                            <div class="reader-selector-area">
+                                <label for="reader-doc-select">Pilih Dokumen:</label>
+                                <select id="reader-doc-select">
+                                    <option value="">-- Pilih Dokumen --</option>
+                                </select>
+                            </div>
+                            <hr>
+                            <div class="reader-pages-list" id="reader-pages-list">
+                                <div class="text-center text-muted p-4 font-sm">Pilih dokumen terlebih dahulu untuk memuat daftar halaman.</div>
+                            </div>
+                        </div>
+
+                        <!-- Reader Canvas Area -->
+                        <div class="reader-main-display glass-card">
+                            <div class="reader-toolbar">
+                                <div class="reader-title-display">
+                                    <h4 id="reader-active-doc-title">Tidak ada dokumen aktif</h4>
+                                    <span id="reader-page-indicator">Halaman 0 dari 0</span>
+                                </div>
+                                <div class="reader-actions">
+                                    <button class="btn btn-secondary btn-sm" id="btn-reader-prev" disabled><i class="fa-solid fa-chevron-left"></i></button>
+                                    <button class="btn btn-secondary btn-sm" id="btn-reader-next" disabled><i class="fa-solid fa-chevron-right"></i></button>
+                                    <button class="btn btn-secondary btn-sm" id="btn-open-pdf" disabled><i class="fa-solid fa-file-pdf"></i> Buka PDF Asli</button>
+                                </div>
+                            </div>
+
+                            <div class="reader-content-split">
+                                <!-- Left side: Page image -->
+                                <div class="reader-image-pane">
+                                    <div id="reader-image-container" class="image-wrapper">
+                                        <div class="image-placeholder">
+                                            <i class="fa-solid fa-image"></i>
+                                            <span>Gambar Halaman akan Tampil di Sini</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <!-- Right side: OCR plain text -->
+                                <div class="reader-text-pane">
+                                    <div class="pane-header">
+                                        <h5><i class="fa-solid fa-align-left"></i> Hasil Teks OCR (Editable)</h5>
+                                        <button class="btn btn-secondary btn-sm" id="btn-copy-page-text">
+                                            <i class="fa-solid fa-copy"></i> Copy Teks
+                                        </button>
+                                    </div>
+                                    <textarea id="reader-page-textarea" placeholder="Teks hasil ekstraksi OCR akan muncul di sini dan dapat Anda salin atau edit."></textarea>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- TAB 4: FULL-TEXT SEARCH -->
+                <section class="tab-pane" id="tab-search">
+                    <div class="search-layout max-w-4xl mx-auto">
+                        <div class="search-bar-card glass-card">
+                            <div class="search-form-group">
+                                <i class="fa-solid fa-magnifying-glass search-icon"></i>
+                                <input type="text" id="search-input" placeholder="Ketik kata kunci untuk mencari (contoh: DFTB, kation, energi, metodologi)...">
+                                <button class="btn btn-primary" id="btn-execute-search">Cari</button>
+                            </div>
+                            <small class="text-muted mt-2 block">Mencari secara case-insensitive pada semua dokumen yang telah di-OCR.</small>
+                        </div>
+
+                        <!-- Search Results -->
+                        <div class="search-results-area mt-4" id="search-results-area">
+                            <!-- Results will be loaded here -->
+                        </div>
+                    </div>
+                </section>
+
+                <!-- TAB 5: LITERATURE MATRIX -->
+                <section class="tab-pane" id="tab-matrix">
+                    <div class="glass-card">
+                        <div class="card-header flex-between">
+                            <div>
+                                <h3><i class="fa-solid fa-table-list"></i> Matriks Sintesis Literatur</h3>
+                                <p class="card-subtitle">Kumpulkan references, metodologi, dan temuan dari skripsi kating untuk bab 2 skripsi Anda.</p>
+                            </div>
+                            <div class="matrix-actions">
+                                <button class="btn btn-secondary btn-sm" id="btn-matrix-add">
+                                    <i class="fa-solid fa-plus"></i> Tambah Referensi
+                                </button>
+                                <button class="btn btn-secondary btn-sm" id="btn-matrix-export-md">
+                                    <i class="fa-solid fa-file-code"></i> Export MD
+                                </button>
+                                <button class="btn btn-secondary btn-sm" id="btn-matrix-export-csv">
+                                    <i class="fa-solid fa-file-csv"></i> Export CSV
+                                </button>
+                                <button class="btn btn-primary btn-sm" id="btn-matrix-save">
+                                    <i class="fa-solid fa-floppy-disk"></i> Simpan Matriks
+                                </button>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <div class="matrix-table-wrapper">
+                                <table class="matrix-table" id="matrix-table">
+                                    <thead>
+                                        <tr>
+                                            <th style="width: 15%">Judul / Topik</th>
+                                            <th style="width: 12%">Penulis & Tahun</th>
+                                            <th style="width: 18%">Tujuan Penelitian</th>
+                                            <th style="width: 18%">Metodologi (DFTB/DFT dll)</th>
+                                            <th style="width: 22%">Temuan Kunci / Hasil</th>
+                                            <th style="width: 10%">Catatan / Sitasi</th>
+                                            <th style="width: 5%">Aksi</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="matrix-tbody">
+                                        <!-- Matrix rows will be rendered here dynamically -->
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+            </div>
+        </main>
+    </div>
+
+    <!-- Notification Toast -->
+    <div class="toast-notification hidden" id="toast">
+        <i class="fa-solid fa-circle-info toast-icon" id="toast-icon"></i>
+        <span class="toast-message" id="toast-message">Notifikasi</span>
+    </div>
+
+    <!-- Custom JS -->
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
